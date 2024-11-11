@@ -13,6 +13,7 @@
 #include <execution>
 #include <ranges>
 #include <numeric>
+#include <io/BufferReader.hpp>
 
 namespace fs = std::filesystem;
 
@@ -26,7 +27,7 @@ std::vector<fs::path> getInputFiles(const std::string& input) {
             }
         }
     } else {
-        // Assume it's a text file containing paths. Currently lacks extensions checking.
+        // Assume it's a text file containing paths. Currently lacks extensions checking for each file, which should be implemented.
         std::ifstream inFile(input);
         std::string line;
         while (std::getline(inFile, line)) {
@@ -55,61 +56,83 @@ void printUsage() {
               << "will be overwritten with the copied classifications\n";
 }
 
-auto extractClassifications(std::shared_ptr<pdal::PointView> view) {
-    const auto size = view->size();
-    
-    // Create vector of indices
-    std::vector<size_t> indices(size);
-    // Fill the vector with indices starting at 0 and ending at size - 1.
-    std::iota(indices.begin(), indices.end(), 0);
-    
-    // Create output vector
-    std::vector<uint8_t> classifications(size);
-    
-    // Transform indices to classifications in parallel
-    std::transform(
-        std::execution::par_unseq,
-        indices.begin(),
-        indices.end(),
-        classifications.begin(),
-        [view](size_t idx) {
-            return view->getFieldAs<uint8_t>(pdal::Dimension::Id::Classification, idx);
-        }
-    );
-    
-    return classifications;
+void extractAndSetClassifications(pdal::PointViewPtr classifiedView, pdal::PointViewPtr unclassifiedView) {
+    const auto size = classifiedView->size();
+
+    // Loop over each point in the classifiedView and copy its classification to the unclassifiedView
+    for (size_t idx = 0; idx < size; ++idx) {
+        uint8_t classification = classifiedView->getFieldAs<uint8_t>(pdal::Dimension::Id::Classification, idx);
+        unclassifiedView->setField<uint8_t>(pdal::Dimension::Id::Classification, idx, classification);
+    }
 }
 
 void processPointClouds(const fs::path& classifiedFile, const fs::path& unclassifiedFile, 
                        const fs::path& outputPath) {
     // Define LAS file path
-    const std::string filename = classifiedFile.string();
+    const std::string classifiedFilename = classifiedFile.string();
+    const std::string unclassifiedFilename = classifiedFile.string();
     
-    // Create a reader
+    // Create a classifiedReader
     pdal::StageFactory factory;
-    pdal::Stage* reader = factory.createStage("readers.las");
+    pdal::Stage* classifiedReader = factory.createStage("readers.las");
+    pdal::Stage* unclassifiedReader = factory.createStage("readers.las");
 
-    // Set the filename as an option for the reader
-    pdal::Options options;
-    options.add("filename", filename);
-    reader->setOptions(options);
+    // Set the filename as an option for the classifiedReader
+    pdal::Options classOptions;
+    classOptions.add("filename", classifiedFilename);
+    classifiedReader->setOptions(classOptions);
+
+    pdal::Options unclassOptions;
+    unclassOptions.add("filename",unclassifiedFilename);
+    unclassifiedReader->setOptions(unclassOptions);
 
     // Prepare PointTable to store metadata and data type
-    pdal::PointTable table;
-    reader->prepare(table);
+    pdal::PointTable classifiedTable;
+    classifiedReader->prepare(classifiedTable);
 
     // Execute the pipeline and retrieve PointViews
-    pdal::PointViewSet pointViewSet = reader->execute(table);
-    // Iterate over views
-    for (auto view : pointViewSet) {
-        // Extract classifications from the 'Classification' dimension
-        std::vector<uint8_t> classifications = extractClassifications(view);
+    pdal::PointViewSet classifiedPointViewSet = classifiedReader->execute(classifiedTable);
 
-        // Todo: Apply the classifications to the unclassified file
-        for (auto cls : classifications){
-            std::cout << static_cast<int>(cls) << " ";
-        }
+    // Prepare PointTable to store metadata and data type
+    pdal::PointTable unclassifiedTable;
+    unclassifiedReader->prepare(unclassifiedTable);
+
+    // Execute the pipeline and retrieve PointViews
+    pdal::PointViewSet unclassPointViewSet = unclassifiedReader->execute(unclassifiedTable);
+
+    // pdal::Dimension::IdList dims = point_view->dims();
+    // pdal::LasHeader las_header = las_reader.header();
+    // int point_class = point_view->getFieldAs<int>(Id::Classification, idx);
+    auto classifiedView = *classifiedPointViewSet.begin();
+    auto unclassifiedView = *unclassPointViewSet.begin();
+
+    auto size = classifiedView->size();
+    for (size_t idx = 0; idx < size; ++idx) {
+        std::cout << classifiedView->getFieldAs<int>(pdal::Dimension::Id::Classification, idx) << " ";
     }
+
+    // Extract classifications from the 'Classification' dimension
+    extractAndSetClassifications(classifiedView, unclassifiedView);
+    // Use the below line somehow for the unclassified view
+    //view->setField<uint8_t>(pdal::Dimension::Id::Classification,idx)
+    // Iterate over views
+    // Todo: Apply the classifications to the unclassified file
+    for (size_t idx = 0; idx < size; ++idx) {
+        std::cout << unclassifiedView->getFieldAs<int>(pdal::Dimension::Id::Classification, idx) << " ";
+    }
+
+    // Create a reader to take in the changed view
+    pdal::BufferReader newViewReader;
+    newViewReader.addView(unclassifiedView);
+
+    pdal::Stage *writer = factory.createStage("writers.las");
+    pdal::Options outputOptions;
+    outputOptions.add("filename",outputPath.string());
+
+    writer->setInput(newViewReader);
+    writer->setOptions(outputOptions);
+    writer->prepare(unclassifiedTable); // Can re-use target table as other properties have not changed
+    writer->execute(unclassifiedTable);
 }
 
 int main(int argc, char* argv[]) {
