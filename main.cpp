@@ -14,6 +14,7 @@
 #include <ranges>
 #include <numeric>
 #include <io/BufferReader.hpp>
+#include <nanoflann.hpp>
 
 namespace fs = std::filesystem;
 
@@ -56,13 +57,87 @@ void printUsage() {
               << "will be overwritten with the copied classifications\n";
 }
 
-void extractAndSetClassifications(pdal::PointViewPtr classifiedView, pdal::PointViewPtr unclassifiedView) {
-    const auto size = classifiedView->size();
+// Point cloud adapter for nanoflann - simplified for k=1 case
+struct PointCloud {
+    struct Point {
+        double x, y, z;
+        uint8_t classification;
+        
+        Point(double x_, double y_, double z_, uint8_t c = 0) 
+            : x(x_), y(y_), z(z_), classification(c) {}
+    };
+    
+    std::vector<Point> points;
+    
+    inline size_t kdtree_get_point_count() const { return points.size(); }
+    
+    inline double kdtree_get_pt(const size_t idx, const size_t dim) const {
+        if (dim == 0) return points[idx].x;
+        if (dim == 1) return points[idx].y;
+        return points[idx].z;
+    }
+    
+    template <class BBOX>
+    bool kdtree_get_bbox(BBOX&) const { return false; }
+};
 
-    // Loop over each point in the classifiedView and copy its classification to the unclassifiedView
-    for (size_t idx = 0; idx < size; ++idx) {
-        uint8_t classification = classifiedView->getFieldAs<uint8_t>(pdal::Dimension::Id::Classification, idx);
-        unclassifiedView->setField<uint8_t>(pdal::Dimension::Id::Classification, idx, classification);
+using KDTree = nanoflann::KDTreeSingleIndexAdaptor<
+    nanoflann::L2_Simple_Adaptor<double, PointCloud>,
+    PointCloud,
+    3
+>;
+
+void extractAndSetClassifications(pdal::PointViewPtr classifiedView, pdal::PointViewPtr unclassifiedView) {
+    // Create point cloud for classified points
+    PointCloud classifiedCloud;
+    classifiedCloud.points.reserve(classifiedView->size());
+    
+    // Fill the classified point cloud
+    for (size_t idx = 0; idx < classifiedView->size(); ++idx) {
+        classifiedCloud.points.emplace_back(
+            classifiedView->getFieldAs<double>(pdal::Dimension::Id::X, idx),
+            classifiedView->getFieldAs<double>(pdal::Dimension::Id::Y, idx),
+            classifiedView->getFieldAs<double>(pdal::Dimension::Id::Z, idx),
+            classifiedView->getFieldAs<uint8_t>(pdal::Dimension::Id::Classification, idx)
+        );
+    }
+    
+    // Construct a kd-tree index
+    KDTree index(3, classifiedCloud, {10 /* max leaf size */});
+    index.buildIndex();
+    
+    // Process unclassified points in parallel
+    const size_t num_points = unclassifiedView->size();
+    std::vector<uint8_t> new_classifications(num_points);
+    
+    #pragma omp parallel for
+    for (size_t idx = 0; idx < num_points; ++idx) {
+        // Get point coordinates
+        double query_pt[3] = {
+            unclassifiedView->getFieldAs<double>(pdal::Dimension::Id::X, idx),
+            unclassifiedView->getFieldAs<double>(pdal::Dimension::Id::Y, idx),
+            unclassifiedView->getFieldAs<double>(pdal::Dimension::Id::Z, idx)
+        };
+        
+        // Single nearest neighbor search
+        size_t ret_index;
+        double out_dist_sqr;
+        nanoflann::KNNResultSet<double> resultSet(1);
+        resultSet.init(&ret_index, &out_dist_sqr);
+        
+        index.findNeighbors(resultSet, query_pt);
+        
+        // Directly use classification from nearest neighbor
+        new_classifications[idx] = classifiedCloud.points[ret_index].classification;
+    }
+    
+    // Apply new classifications
+    for (size_t idx = 0; idx < num_points; ++idx) {
+        unclassifiedView->setField<uint8_t>(
+            pdal::Dimension::Id::Classification, 
+            idx, 
+            new_classifications[idx]
+        );
     }
 }
 
@@ -100,26 +175,11 @@ void processPointClouds(const fs::path& classifiedFile, const fs::path& unclassi
     // Execute the pipeline and retrieve PointViews
     pdal::PointViewSet unclassPointViewSet = unclassifiedReader->execute(unclassifiedTable);
 
-    // pdal::Dimension::IdList dims = point_view->dims();
-    // pdal::LasHeader las_header = las_reader.header();
-    // int point_class = point_view->getFieldAs<int>(Id::Classification, idx);
-    auto classifiedView = *classifiedPointViewSet.begin();
+    auto classifiedView = *classifiedPointViewSet.begin(); // Assume there is only one PointView. Might need to review this
     auto unclassifiedView = *unclassPointViewSet.begin();
-
-    auto size = classifiedView->size();
-    for (size_t idx = 0; idx < size; ++idx) {
-        std::cout << classifiedView->getFieldAs<int>(pdal::Dimension::Id::Classification, idx) << " ";
-    }
 
     // Extract classifications from the 'Classification' dimension
     extractAndSetClassifications(classifiedView, unclassifiedView);
-    // Use the below line somehow for the unclassified view
-    //view->setField<uint8_t>(pdal::Dimension::Id::Classification,idx)
-    // Iterate over views
-    // Todo: Apply the classifications to the unclassified file
-    for (size_t idx = 0; idx < size; ++idx) {
-        std::cout << unclassifiedView->getFieldAs<int>(pdal::Dimension::Id::Classification, idx) << " ";
-    }
 
     // Create a reader to take in the changed view
     pdal::BufferReader newViewReader;
@@ -131,7 +191,7 @@ void processPointClouds(const fs::path& classifiedFile, const fs::path& unclassi
 
     writer->setInput(newViewReader);
     writer->setOptions(outputOptions);
-    writer->prepare(unclassifiedTable); // Can re-use target table as other properties have not changed
+    writer->prepare(unclassifiedTable); // Should be able to re-use target table as other properties have not changed
     writer->execute(unclassifiedTable);
 }
 
