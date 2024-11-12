@@ -145,7 +145,7 @@ void processPointClouds(const fs::path& classifiedFile, const fs::path& unclassi
                        const fs::path& outputPath) {
     // Define LAS file path
     const std::string classifiedFilename = classifiedFile.string();
-    const std::string unclassifiedFilename = classifiedFile.string();
+    const std::string unclassifiedFilename = unclassifiedFile.string();
     
     // Create a classifiedReader
     pdal::StageFactory factory;
